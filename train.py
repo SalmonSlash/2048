@@ -7,10 +7,10 @@ import random
 from collections import deque
 
 class ACTIONS:
+    LEFT = 0
     RIGHT = 1
-    LEFT = 2
-    UP = 3
-    DOWN = 4
+    UP = 2
+    DOWN = 3
 
 class Point:
     def __init__(self, x, y):
@@ -66,22 +66,69 @@ class GameAi2048:
         # เติมค่า 0 ให้ครบขนาดแถวที่กำหนด (self.size)
         return new_row + [0] * (self.size - len(new_row))
 
+    def _move(self, direction):
+        original_grid = self.board.copy()
+
+        if direction == 0:
+            self.board = np.array([self._compress(row) for row in self.board]) #ใช้ _compress แบบปกติ
+        elif direction == 1:
+            self.board = np.array([self._compress(row[::-1])[::-1] for row in self.board]) #ใช้ _compress แบบกลับด้าน
+        elif direction == 2:
+            self.board = np.array([self._compress(col) for col in self.board.T]).T #self.board.T คือการเปลี่ยนแถวเป็นคอลัมน์ ต้องเป็น 2D Array เมธอด .T ใช้ได้กับ NumPy Array โดยเฉพาะ แต่ละแถวต้องมีความยาวเท่ากัน
+        elif direction == 3:
+            # พลิกคอลัมน์, _compress แล้วพลิกกลับและ transpose กลับ
+            self.board = np.array([self._compress(col[::-1])[::-1] for col in self.board.T]).T
+
+        return not np.array_equal(original_grid, self.board)
+
+    def _get_state(self):
+            state = np.where(self.board == 0, 0,np.log2(self.board)).astype(int) #เช็คว่าเป็น 0 หรือไม่ ถ้าใช่ให้เป็น 0 ถ้าไม่ใช่ให้ log2 ของตัวเลขในบอร์ด และทำเป้น int
+            return state.flatten() #แปลงเป็น 1D Array
+
+    def _get_state2(self):
+        state = np.where(self.board == 0, 0,np.log2(self.board)).astype(int) #เช็คว่าเป็น 0 หรือไม่ ถ้าใช่ให้เป็น 0 ถ้าไม่ใช่ให้ log2 ของตัวเลขในบอร์ด และทำเป้น int
+        return state
+
+    def step(self, action):
+        moved = self._move(action)
+        if moved:
+            self.add_random_tile()
+        else:
+            self.done = True
+        return self.board, self.score, self.done
+
+    def _is_game_over(self):
+        return not any(
+            np.any(self.board[:-1,:] == self.board[1:,:]) or
+            np.any(self.board[:,:-1] == self.board[:,1:]))
+
+class DQN(nn.Module):
+    def __init__(self, input_shape, num_actions):
+        super(DQN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64*input_shape[1]*input_shape[2], 512),
+            nn.ReLU(),
+            nn.Linear(512, num_actions)
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
 env = GameAi2048()
 initial_state = env.reset()
 
 print("Initial State:")
 print(initial_state)
 print(env._compress(initial_state[0]))
-
-
-class LinearQNet(nn.Module):
-    def __init__(self, inputSize, hiddenSize, outputSize):
-        super().__init__()
-        self.linear1 = nn.Linear(inputSize, hiddenSize)
-        self.linear2 = nn.Linear(hiddenSize, hiddenSize)
-        self.linear3 = nn.Linear(hiddenSize, outputSize)
-    def forward(self, x):
-        x = F.relu(self.linear1(x))
-        x = F.relu(self.linear2(x))
-        x = self.linear3(x)
-        return x
+print(env._move(3))
+print(env.board)
+print(env._get_state2())
+print(env._get_state())

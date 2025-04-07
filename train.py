@@ -82,12 +82,9 @@ class GameAi2048:
         return not np.array_equal(original_grid, self.board)
 
     def _get_state(self):
+        with np.errstate(divide='ignore'):#ใช้ np.errstate เพื่อจัดการกับการหารด้วย 0 โดยไม่ให้เกิดข้อผิดพลาด
             state = np.where(self.board == 0, 0,np.log2(self.board)).astype(int) #เช็คว่าเป็น 0 หรือไม่ ถ้าใช่ให้เป็น 0 ถ้าไม่ใช่ให้ log2 ของตัวเลขในบอร์ด และทำเป้น int
             return state.flatten() #แปลงเป็น 1D Array
-
-    def _get_state2(self):
-        state = np.where(self.board == 0, 0,np.log2(self.board)).astype(int) #เช็คว่าเป็น 0 หรือไม่ ถ้าใช่ให้เป็น 0 ถ้าไม่ใช่ให้ log2 ของตัวเลขในบอร์ด และทำเป้น int
-        return state
 
     def step(self, action):
         moved = self._move(action)
@@ -103,18 +100,27 @@ class GameAi2048:
             np.any(self.board[:,:-1] == self.board[:,1:]))
 
 class DQN(nn.Module):
-    def __init__(self, input_shape, num_actions):
+    def __init__(self, input_shape, num_actions): #ที่เขาสอนจะเป็น input_shape=(1,4,4) (ช่องสัญญาณ,กว้าง,สูง) แต่ที่เราทำจะเป็น input_shape=4
         super(DQN, self).__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.Conv2d(1, 32, kernel_size=3, padding=1), #1คือจำนวนช่องสัญญาณ (channels) ของภาพที่ป้อนเข้าไปในโมเดล ถ้าภาพสีมี 3 ช่องสัญญาณ (R, G, B) ถ้าเป็นภาพขาวดำจะมี 1 ช่องสัญญาณ
+                                                        #32 Filter: หมายถึงสร้าง 32 ลวดลายที่ต่างกัน เพื่อตรวจจับสถานะเกม
+                                                        # ตัวอย่างการทำงาน:
+                                                        # Filter 1: ตรวจจับตัวเลขที่อยู่ติดกันในแนวตั้ง
+                                                        # Filter 2: ตรวจจับตัวเลขที่อยู่ติดกันในแนวนอน
+                                                        # Filter 3: ตรวจจับช่องว่างในบอร์ด
+                                                        #kernel_size=3: ขนาดของ Filter คือ 3x3
+                                                        #padding=1: เพิ่ม padding รอบๆ ขอบของภาพ เพื่อไม่ให้ขนาดของภาพลดลงหลังจากการ convolutions
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),#32->64 จำนวน Filter มากขึ้น → เรียนรู้ Features ได้ละเอียดขึ้น
             nn.ReLU()
         )
         self.fc = nn.Sequential(
-            nn.Linear(64*input_shape[1]*input_shape[2], 512),
+            nn.Linear(64 * input_shape[1] * input_shape[2], 512),
             nn.ReLU(),
-            nn.Linear(512, num_actions)
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, num_actions)
         )
 
     def forward(self, x):
@@ -122,13 +128,120 @@ class DQN(nn.Module):
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
-env = GameAi2048()
-initial_state = env.reset()
+# ตัวอย่างการใช้งานโมเดล DQN -----------------------------------------------------------------------------------------------------------------------
+# input_grid = [
+#     [0, 0, 0, 0],
+#     [0, 0, 0, 0],
+#     [0, 0, 2, 1],
+#     [1, 0, 2, 0]
+# ]
+# # แปลงเป็น Tensor
+# input_tensor = torch.FloatTensor(input_grid).unsqueeze(0).unsqueeze(0)  # Shape: (1,1,4,4)
 
-print("Initial State:")
-print(initial_state)
-print(env._compress(initial_state[0]))
-print(env._move(3))
-print(env.board)
-print(env._get_state2())
-print(env._get_state())
+# # ส่งเข้าโมเดล
+# model = DQN(4,4)
+# q_values = model(input_tensor)
+# print("Q-values:", q_values)
+# print("Output shape:", q_values.shape)
+#-----------------------------------------------------------------------------------------------------------------------
+
+class DQNAgent:
+    def __init__(self, env):
+        self.env = env
+        self.input_shape = (1, 4, 4)
+        self.num_actions = 4
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.batch_size = 128
+
+        self.model = DQN(self.input_shape, self.num_actions)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.memory = deque(maxlen=10000) #ใช้ deque เพื่อเก็บประสบการณ์การเล่นเกม
+        self.reward_threshold = 200 #ค่าคะแนนที่ต้องการให้ agent ได้
+
+    def act(self, state):
+        # """เลือกการกระทำโดยใช้ epsilon-greedy policy"""
+        if np.random.rand() <= self.epsilon:
+            print("Random Action")
+            return np.random.randint(4)
+        # if self.epsilon <= 0.02:
+        #     print(state)
+        state = np.where(state == 0, 0, np.log2(state)).astype(int)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
+        # print("State Tensor: ", state_tensor.shape)
+        q_values = self.model(state_tensor)
+        return torch.argmax(q_values).item()
+
+    def remember(self, state, action, reward, next_state, done):
+        """เก็บประสบการณ์ใน replay buffer"""
+        self.memory.append((state, action, reward, next_state, done))
+    def replay(self):
+        """ฝึกโมเดลจากประสบการณ์"""
+        if len(self.memory) < self.batch_size:
+            return
+
+        minibatch = random.sample(self.memory, self.batch_size)
+        states = torch.FloatTensor(np.array([np.where(t[0] == 0, 0, np.log2(t[0])) for t in minibatch])).unsqueeze(1)
+        actions = torch.LongTensor([t[1] for t in minibatch])
+        rewards = torch.FloatTensor([t[2] for t in minibatch])
+        next_states = torch.FloatTensor(np.array([np.where(t[3] == 0, 0, np.log2(t[3])) for t in minibatch])).unsqueeze(1)
+        dones = torch.FloatTensor([t[4] for t in minibatch])
+
+        # print("States: ", states.shape)
+        current_q = self.model(states).gather(1, actions.unsqueeze(1))
+        next_q = self.model(next_states).max(1)[0].detach()
+        target_q = rewards + (1 - dones) * self.gamma * next_q
+
+        loss = nn.MSELoss()(current_q.squeeze(), target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.epsilon > self.epsilon_min and self.mean_score50 > self.reward_threshold:
+            self.epsilon *= self.epsilon_decay
+            self.reward_threshold += 10 # เพิ่มค่าคะแนนที่ต้องการให้ agent ได้
+
+
+
+    def train(self, episodes):
+        """ฝึกโมเดลจำนวน episode ที่กำหนด"""
+        scores = []
+        for e in range(episodes):
+            state = self.env.reset()
+            total_reward = 0
+            done = False
+
+            while not done:
+                action = self.act(state)
+                next_state, reward, done = self.env.step(action)
+                self.remember(state, action, reward, next_state, done)
+                self.replay()
+                total_reward += reward
+                state = next_state
+
+            scores.append(total_reward)
+            self.mean_score50 = np.mean(scores[-20:])
+            print(f"Episode: {e+1}, Score: {total_reward}, Epsilon: {self.epsilon:.2f}")
+
+        return scores
+
+# if __name__ == "__main__":
+env = GameAi2048()
+agent = DQNAgent(env)
+scores = agent.train(episodes=300)
+print("Training complete! : ", max(scores))
+print("mean score50: ", np.mean(scores[-50:]))
+
+    # บันทึกโมเดล
+    # torch.save(agent.model.state_dict(), "2048_dqn.pth")
+
+    # print("Initial State:")
+    # # print(initial_state)
+    # # print(env._compress(initial_state[0]))
+    # print(env._move(3))
+    # print(env.board)
+    # print(env._get_state2())
+    # print(env._get_state())
+

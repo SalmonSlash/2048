@@ -5,6 +5,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import random
 from collections import deque
+import datetime
 
 class ACTIONS:
     LEFT = 0
@@ -164,7 +165,7 @@ class DQNAgent:
     def act(self, state):
         # """เลือกการกระทำโดยใช้ epsilon-greedy policy"""
         if np.random.rand() <= self.epsilon:
-            print("Random Action")
+            # print("Random Action")
             return np.random.randint(4)
         # if self.epsilon <= 0.02:
         #     print(state)
@@ -199,6 +200,7 @@ class DQNAgent:
         loss.backward()
         self.optimizer.step()
 
+        # *** การฝึกแบบขั้นบรรได (ดูจาก epsilon )สามารถบอกได้ว่าช่องไหนของบอร์ดที่ agent ใช้ในการสำรวจและเล่นจริง ทำให้รู้ว่าจำนวน episode พอหรือไม่ เจอเกมที่สำคัญรึยัง
         if self.epsilon > self.epsilon_min and self.mean_score50 > self.reward_threshold:
             self.epsilon *= self.epsilon_decay
             self.reward_threshold += 10 # เพิ่มค่าคะแนนที่ต้องการให้ agent ได้
@@ -225,23 +227,36 @@ class DQNAgent:
             self.mean_score50 = np.mean(scores[-20:])
             print(f"Episode: {e+1}, Score: {total_reward}, Epsilon: {self.epsilon:.2f}")
 
+        timestamp = datetime.datetime.now().strftime("%m%d_%H%M%S")
+        filename = f"checkpoint_{timestamp}.pth"
+
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'memory': list(self.memory),  # แปลง deque ให้ save ได้
+            'epoch': episodes
+            }
+        torch.save(checkpoint, filename)
+
         return scores
 
 # if __name__ == "__main__":
 env = GameAi2048()
 agent = DQNAgent(env)
-scores = agent.train(episodes=300)
+scores = agent.train(episodes=100)
 print("Training complete! : ", max(scores))
 print("mean score50: ", np.mean(scores[-50:]))
 
-    # บันทึกโมเดล
-    # torch.save(agent.model.state_dict(), "2048_dqn.pth")
 
-    # print("Initial State:")
-    # # print(initial_state)
-    # # print(env._compress(initial_state[0]))
-    # print(env._move(3))
-    # print(env.board)
-    # print(env._get_state2())
-    # print(env._get_state())
+# บันทึกโมเดล
+# torch.save(agent.model.state_dict(), "2048_dqn.pth")
+
+# print("Initial State:")
+# # print(initial_state)
+# # print(env._compress(initial_state[0]))
+# print(env._move(3))
+# print(env.board)
+# print(env._get_state2())
+# print(env._get_state())
 

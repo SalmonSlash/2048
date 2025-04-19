@@ -230,7 +230,7 @@ class DQNAgent:
 env = GameAi2048()
 agent = DQNAgent(env)
 
-checkpoint_path = "checkpoint_0408_181159.pth"
+checkpoint_path = "checkpoint_0408_010817.pth"
 if os.path.exists(checkpoint_path):
     print("Loading checkpoint...")
     agent.load_checkpoint(checkpoint_path)

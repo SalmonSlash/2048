@@ -1,271 +1,261 @@
-import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
-from collections import deque
-import mss
-import cv2
-import torch
-import pyautogui
-from PIL import Image
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+import random
 import os
-import pytesseract
+import datetime
+import re
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+class Game2048Environment:
+    def __init__(self):
+        self.driver = None
+        self.setup_driver()
+        self.current_score = 0
+        self.prev_score = 0
 
-def select_game_region():
-    with mss.mss() as sct:
-        # เลือกจอหลัก (monitor 1)
-        primary_mon = sct.monitors[1]
+    def setup_driver(self):
+        options = webdriver.ChromeOptions()
+        options.add_argument("--start-maximized")
+        self.driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options
+        )
+        self.driver.get("https://www.2048.org/")
+        WebDriverWait(self.driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "game-container")))
+        print("เจอแล้ว!")
+# # 2. ฟังก์ชันดึงสถานะตารางจาก DOM (scrape grid)
+# # ------------------------------------------------------------------------------
+    def scrape_grid(self):
+        grid = self.driver.execute_script("""
+            let cells = document.querySelectorAll('.tile');
+            let grid = Array(4).fill(0).map(() => Array(4).fill(0));
+            cells.forEach(cell => {
+                const classes = Array.from(cell.classList);
+                const posClass = classes.find(c => c.startsWith('tile-position'));
+                const [_, x, y] = posClass.split('-').map(Number);
+                const value = parseInt(cell.querySelector('.tile-inner').textContent) || 0;
+                grid[y-1][x-1] = Math.max(grid[y-1][x-1], value);
+            });
+            return grid;
+        """)
+        return np.array(grid, dtype=np.float32)
 
-        # จับภาพจอหลัก
-        screen = sct.grab(primary_mon)
-        img = cv2.cvtColor(np.array(screen), cv2.COLOR_BGRA2BGR)
+    def get_score(self):
+        """ดึงคะแนนปัจจุบันจากเกม (ใช้ Regular Expression)"""
+        try:
+            elem = WebDriverWait(self.driver, 2).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "score-container"))
+            )
+            # ค้นหาตัวเลขทั้งหมดในข้อความ
+            numbers = re.findall(r'\d+', elem.text)
+            return int(numbers[0]) if numbers else 0
+        except (TimeoutException, NoSuchElementException, ValueError):
+            return 0
 
-        # ปรับขนาดภาพเพื่อแสดงผล
-        scale_percent = 60  # ปรับค่านี้ตามต้องการ
-        width = int(img.shape[1] * scale_percent/100)
-        height = int(img.shape[0] * scale_percent/100)
-        resized = cv2.resize(img, (width, height))
+    def is_game_over(self):
+        try:
+            self.driver.find_element(By.CLASS_NAME, "game-over")
+            return True
+        except NoSuchElementException:
+            return False
 
-        # ให้ผู้ใช้เลือกพื้นที่
-        roi = cv2.selectROI("เลือกพื้นที่เกมด้วยการลากเมาส์ (กด Space หรือ Enter เพื่อยืนยัน)", resized)
-        cv2.destroyAllWindows()
+    def reset(self):
+        """เริ่มเกมใหม่"""
+        self.current_score = 0
+        self.prev_score = 0
+        time.sleep(0.5)  # รอให้เกมรีเซ็ต
+        return self.scrape_grid()
 
-        # คำนวณพิกัดจริงโดยคำนึงถึงการปรับขนาด
-        scale_x = img.shape[1] / width
-        scale_y = img.shape[0] / height
+    def step(self, action):
+        actions = [Keys.ARROW_UP, Keys.ARROW_RIGHT, Keys.ARROW_DOWN, Keys.ARROW_LEFT]
+        self.driver.find_element(By.TAG_NAME, "body").send_keys(actions[action])
 
-        x = int(roi[0] * scale_x) + primary_mon['left']
-        y = int(roi[1] * scale_y) + primary_mon['top']
-        w = int(roi[2] * scale_x)
-        h = int(roi[3] * scale_y)
-        return (x, y, w, h)
+        # รอการเคลื่อนไหวเสร็จสิ้น
+        time.sleep(0.1)
 
-def capture_screen(bbox=None):
-    with mss.mss() as sct:
-        monitor = sct.monitors[2] if bbox is None else {
-            "top": bbox[1],
-            "left": bbox[0],
-            "width": bbox[2],
-            "height": bbox[3]
-        }
-        sct_img = sct.grab(monitor)
-        return cv2.cvtColor(np.array(sct_img), cv2.COLOR_BGRA2BGR)
+        # ดึงสถานะใหม่และคำนวณรางวัล
+        new_grid = self.scrape_grid()
+        self.current_score = self.get_score()
+        reward = self.current_score - self.prev_score
+        self.prev_score = self.current_score
+        done = self.is_game_over()
 
-possible_values = [2 ** i for i in range(1, 18)]  # 2 ถึง 131072
+        return new_grid, reward, done
 
-def correct_ocr_value(ocr_value, possible_values):
-    """
-    ปรับแก้ค่าที่ได้จาก OCR ให้ใกล้เคียงกับค่าที่เป็นไปได้ในเกม 2048
-    """
-    if ocr_value in possible_values:
-        return ocr_value
-    else:
-        # คำนวณค่าที่ใกล้เคียงที่สุด
-        closest_value = min(possible_values, key=lambda x: abs(x - ocr_value))
-        # หากความแตกต่างน้อยกว่า 20% ให้ปรับเป็นค่าที่ใกล้เคียงที่สุด
-        if abs(closest_value - ocr_value) / closest_value < 0.2:
-            return closest_value
-        else:
-            return 0  # หากความแตกต่างมากเกินไป ให้ถือว่าเป็นช่องว่าง
+class DQN(nn.Module):
+    def __init__(self, input_shape, num_actions):
+        super(DQN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64 * input_shape[1] * input_shape[2], 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, num_actions)
+        )
 
-def ocr_tile(tile_gray):
-    # 1. ปรับขนาดภาพเพื่อเพิ่มความละเอียด
-    tile = cv2.resize(tile_gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
-    # 2. ปรับคอนทราสต์ด้วย CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    tile = clahe.apply(tile)
-
-    # 3. ใช้ Threshold แบบ Otsu เพื่อแยกข้อความ
-    _, tile = cv2.threshold(tile, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 4. ตรวจสอบและปรับความเป็นขาว-ดำให้เหมาะสม
-    white = cv2.countNonZero(tile)
-    black = tile.size - white
-    if white < black:
-        tile = cv2.bitwise_not(tile)
-
-    # 5. ใช้ Morphological Closing เพื่อเชื่อมต่อส่วนของตัวเลข
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
-    tile = cv2.morphologyEx(tile, cv2.MORPH_CLOSE, kernel)
-    # 6. ใช้ Tesseract OCR เพื่ออ่านตัวเลข
-    config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
-    txt = pytesseract.image_to_string(tile, config=config).strip()
-
-    # 7. แปลงข้อความเป็นตัวเลขและปรับแก้
-    try:
-        ocr_value = int(txt)
-        print(f"OCR raw result: '{txt}' → interpreted as: {ocr_value}")
-    except ValueError:
-        return 0  # หากไม่สามารถแปลงเป็นตัวเลขได้ ให้ถือว่าเป็นช่องว่าง
-
-    return correct_ocr_value(ocr_value, possible_values)
-
-
-def process_grid(img):
-    # img: ภาพ BGR ของพื้นที่เกมที่จับมาแล้ว
-    h, w = img.shape[:2]
-    tile_h = h // 4
-    tile_w = w // 4
-    grid = []
-
-    for r in range(4):
-        row_vals = []
-        for c in range(4):
-            # ตัดขอบของแต่ละช่องเพื่อหลีกเลี่ยงกรอบ
-            m_h, m_w = int(0.1 * tile_h), int(0.1 * tile_w)
-            y1 = r * tile_h + m_h
-            y2 = (r + 1) * tile_h - m_h
-            x1 = c * tile_w + m_w
-            x2 = (c + 1) * tile_w - m_w
-
-            # แปลงภาพเป็น Grayscale
-            tile_gray = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-
-            # อ่านค่าตัวเลขจากแต่ละช่อง
-            val = ocr_tile(tile_gray)
-
-            row_vals.append(val)
-        grid.append(row_vals)
-
-    return grid
+    def forward(self, x):
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
 
 
-def main_loop():
-    # เลือกพื้นที่เกมครั้งเดียว
-    bbox  = select_game_region()
-    print(f"Game region: {bbox}")
+class DQNAgent:
+    def __init__(self, env):
+        self.env = env
+        self.input_shape = (1, 4, 4)
+        self.num_actions = 4
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.batch_size = 128
 
-    while True:
-        frame = capture_screen(bbox)       # :contentReference[oaicite:0]{index=0}
-        grid = process_grid(frame)
+        self.model = DQN(self.input_shape, self.num_actions)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.memory = deque(maxlen=10000)
+        self.reward_threshold = 2000
+        self.epoch = 0
 
-        # แสดงผลลัพธ์บนคอนโซลและหน้าต่าง
-        for row in grid:
-            print(row, end='\n')
-        print("-" * 20)
+        self.mean_score50 = 0
 
-        # รอ key press: กด 'q' เพื่อออกจากลูป
-        if cv2.waitKey(100) & 0xFF == ord('q'):
-            break
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.epsilon = checkpoint.get('epsilon', self.epsilon)
+        self.memory = deque(checkpoint.get('memory', []), maxlen=10000)
+        self.epoch = checkpoint.get('epoch', self.epoch)
 
-        cv2.destroyAllWindows()
+        self.epsilon =  0.50 # Reset epsilon to 1.0 for fresh training
+
+        print(f"Loaded checkpoint from epoch {self.epoch}, epsilon: {self.epsilon:.2f}")
+        # print(f"Memory size: {len(self.memory)}")
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return np.random.randint(4)
+
+        state = np.where(state == 0, 0, np.log2(np.maximum(state, 1e-8))).astype(int)
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0)
+
+        q_values = self.model(state_tensor)
+        return torch.argmax(q_values).item()
+
+    def remember(self, state, action, reward, next_state, done):
+        """เก็บประสบการณ์ใน replay buffer"""
+        self.memory.append((state, action, reward, next_state, done))
+    def replay(self):
+        """ฝึกโมเดลจากประสบการณ์"""
+        if len(self.memory) < self.batch_size:
+            return
+
+        minibatch = random.sample(self.memory, self.batch_size)
+        states = torch.FloatTensor(np.array([np.where(t[0] == 0, 0, np.log2(np.maximum(t[0], 1e-8))) for t in minibatch])).unsqueeze(1)
+        actions = torch.LongTensor([t[1] for t in minibatch])
+        rewards = torch.FloatTensor([t[2] for t in minibatch])
+        next_states = torch.FloatTensor(np.array([np.where(t[3] == 0, 0, np.log2(np.maximum(t[3], 1e-8))) for t in minibatch])).unsqueeze(1)
+        dones = torch.FloatTensor([t[4] for t in minibatch])
+
+
+        current_q = self.model(states).gather(1, actions.unsqueeze(1))
+        next_q = self.model(next_states).max(1)[0].detach()
+        target_q = rewards + (1 - dones) * self.gamma * next_q
+
+        loss = nn.MSELoss()(current_q.squeeze(), target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+
+        if self.epsilon > self.epsilon_min and self.mean_score50 > self.reward_threshold:
+            self.epsilon *= self.epsilon_decay
+            self.reward_threshold += 10
+
+    def train(self, episodes):
+        scores = []
+        timestamp = datetime.datetime.now().strftime("%m%d_%H%M%S")
+        for e in range(episodes):
+            state = self.env.reset()
+            total_reward = 0
+            done = False
+
+            while not done:
+                action = self.act(state)
+                next_state, reward, done = self.env.step(action)
+                self.remember(state, action, reward, next_state, done)
+                self.replay()
+                total_reward += reward
+                state = next_state
+
+            scores.append(total_reward)
+            self.mean_score50 = np.mean(scores[-20:])
+            print(f"Episode: {e+1}, Score: {total_reward}, Epsilon: {self.epsilon:.2f}")
+
+        filename = f"checkpoint_{timestamp}.pth"
+        print(f"Saving checkpoint to {filename}...")
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epsilon': self.epsilon,
+            'memory': list(self.memory),  # แปลง deque ให้ save ได้
+            'epoch': episodes
+            }
+        torch.save(checkpoint, filename)
+        return scores
 
 if __name__ == "__main__":
-    # main_loop()
-    h = select_game_region()
-    Image = capture_screen(h)
-    resut = process_grid(Image)
-    print(resut[0],end='\n')
-    print(resut[1],end='\n')
-    print(resut[2],end='\n')
-    print(resut[3],end='\n')
+    env = Game2048Environment()
+    agent = DQNAgent(env)
+    checkpoint_path = "checkpoint_0408_ok.pth"
+    if os.path.exists(checkpoint_path):
+        print("Loading checkpoint...")
+        agent.load_checkpoint(checkpoint_path)
+        agent.epsilon = 0.01  # ปิดการสุ่มเพื่อเล่นด้วย AI ล้วน
+
+    state = env.reset()
+    total_reward = 0
+    done = False
+
+    while not done:
+        action = agent.act(state)
+        state, reward, done = env.step(action)
+        total_reward += reward
+        print(f"Score: {total_reward}", end="\r")  # แสดงคะแนนแบบ real-time
+
+    env.driver.quit()
 
 
-# class Real2048Env:
-#     def __init__(self):
-#         self.current_dir = 1  # ทิศทางเริ่มต้น
-#         self.model = torch.load('checkpoint_0408_ok.pth')
-#         self.board_bbox = detect_2048_board()
 
-#     def execute_move(self, action):
-#         key_map = {0: 'up', 1: 'right', 2: 'down', 3: 'left'}
-#         pyautogui.press(key_map[action])
-#         time.sleep(0.2)  # รอให้เกมประมวลผล
+    # grid = env.scrape_grid()
+    # print("Current 4×4 grid state:")
+    # for row in grid:
+    #     print(row)
 
-#     def get_reward(self, prev_score, new_score):
-#         return new_score - prev_score
+    # body = env.driver.find_element(By.TAG_NAME, "body")
+    # body.send_keys(Keys.ARROW_UP)
 
-#     def run_episode(self):
-#         while True:
-#             prev_state = image_to_state(self.board_bbox)
-#             action = self.model.act(prev_state)
-#             self.execute_move(action)
+    # time.sleep(1)
 
-#             new_state = image_to_state(self.board_bbox)
-#             done = (new_state == prev_state).all()
-
-#             if done:
-#                 break
-
-
-# class DQN(nn.Module):
-#     def __init__(self, input_shape, num_actions):
-#         super(DQN, self).__init__()
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-#             nn.ReLU(),
-#             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-#             nn.ReLU()
-#         )
-#         self.fc = nn.Sequential(
-#             nn.Linear(64 * input_shape[1] * input_shape[2], 512),
-#             nn.ReLU(),
-#             nn.Linear(512, 1024),
-#             nn.ReLU(),
-#             nn.Linear(1024, num_actions)
-#         )
-
-#     def forward(self, x):
-#         x = self.conv(x)
-#         x = x.view(x.size(0), -1)
-#         return self.fc(x)
-
-
-# class DQNAgent:
-#     def __init__(self, env):
-#         self.env = env
-#         self.input_shape = (1, 4, 4)
-#         self.num_actions = 4
-
-#         self.model = DQN(self.input_shape, self.num_actions)
-
-#         # ปิดการใช้งาน epsilon สำหรับสุ่ม action
-#         self.epsilon = 0.0  # ปิดการสุ่ม action ทั้งหมด
-
-#     def load_checkpoint(self, path):
-#         """โหลดเฉพาะส่วนที่จำเป็นสำหรับ inference"""
-#         checkpoint = torch.load(path)
-
-#         # โหลดเฉพาะน้ำหนักโมเดล
-#         self.model.load_state_dict(checkpoint['model_state_dict'])
-
-#         # ตั้งค่าโมเดลเป็นโหมดประเมินผล
-#         self.model.eval()
-
-#         print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
-
-#     def act(self, state):
-#         """การทำนาย action จากโมเดล (ไม่มีส่วนสุ่ม)"""
-#         # แปลง state ให้อยู่ในรูปแบบที่โมเดลรับได้
-#         state_tensor = torch.FloatTensor(
-#             np.where(state == 0, 0, np.log2(np.maximum(state, 1e-8)))
-#         ).unsqueeze(0).unsqueeze(0)
-
-#         # ทำนายด้วยโมเดล
-#         with torch.no_grad():
-#             q_values = self.model(state_tensor)
-
-#         return torch.argmax(q_values).item()
-
-# env = Real2048Env()
-# agent = DQNAgent(env)
-
-# checkpoint_path = "checkpoint_0408_181159.pth"
-# if os.path.exists(checkpoint_path):
-#     agent.load_checkpoint(checkpoint_path)
-#     print("โหลดโมเดลสำเร็จ พร้อมเล่นเกม!")
-# else:
-#     print("ไม่พบไฟล์ checkpoint!")
-#     exit()
-
-# # ตัวอย่างการเล่นเกมจริง (ปรับใช้ตามระบบจับภาพหน้าจอ)
-# state = env.reset()
-# done = False
-
-# while not done:
-#     action = agent.act(state)
-#     next_state, reward, done = env.step(action)
-#     state = next_state
+    # grid = env.scrape_grid()
+    # print("Current 4×4 grid state:")
+    # for row in grid:
+    #     print(row)
+    # time.sleep(5)  # รอ 5 วินาทีเพื่อดูผลลัพธ์
+    # env.driver.quit()
